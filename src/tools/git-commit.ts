@@ -5,10 +5,11 @@
  * `git commit -S ...` here when the shape matches.
  */
 
-import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PassphraseCache } from "../cache.js";
 import type { ExecFn } from "../exec.js";
+import { formatGateReason, runSignGate, type SignGateRequest } from "../gate.js";
 import { runGitWithFd3Passphrase, zeroize } from "../gpg.js";
 import { resolveSigningKey } from "../keys.js";
 import { promptPassphrase } from "../prompt.js";
@@ -40,6 +41,27 @@ export interface GitCommitToolDeps {
 	cache: PassphraseCache;
 	shimPath: string;
 	realGpgPath?: string;
+	/**
+	 * Pre-signing gate supplier. Called once per signing attempt with a
+	 * partially-populated `SignGateRequest`; returns the full request so the
+	 * tool can run the gate. Optional — when absent, no gate runs (legacy
+	 * Phase 1 behavior). Wiring this up is how `src/index.ts` plugs the
+	 * session config / confirmed-keys / Touch ID policy into the tool.
+	 */
+	gateSupplier?: (ctx: ExtensionContext, base: GateBase) => SignGateRequest | null;
+}
+
+/**
+ * The per-call gate inputs the tool already knows about. `gateSupplier`
+ * layers the session-scoped fields on top (config, confirmedKeys).
+ */
+export interface GateBase {
+	keyid: string;
+	keyDisplay: string;
+	operation: string;
+	subject?: string;
+	fromCache: boolean;
+	signal?: AbortSignal;
 }
 
 /**
@@ -149,6 +171,26 @@ export function createGitCommitTool(deps: GitCommitToolDeps): ToolDefinition<typ
 						throw new Error(`git_commit: ${reasonText}`);
 					}
 					passphrase = result.passphrase;
+				}
+
+				// Pre-signing gate (Touch ID + confirm). Bail out early on denial
+				// so we never spawn git — cleaner UX than a retry loop on a cancel.
+				if (deps.gateSupplier) {
+					const gateReq = deps.gateSupplier(ctx, {
+						keyid: key.keyid,
+						keyDisplay: key.display,
+						operation: "git_commit",
+						subject: message.split(/\r?\n/)[0] ?? "",
+						fromCache,
+						...(signal ? { signal } : {}),
+					});
+					if (gateReq) {
+						const gateResult = await runSignGate(ctx, gateReq);
+						if (!gateResult.ok) {
+							zeroize(passphrase);
+							throw new Error(formatGateReason(gateResult));
+						}
+					}
 				}
 
 				onUpdate?.({

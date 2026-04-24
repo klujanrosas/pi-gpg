@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from "vitest";
  * signal that the extension can load inside Pi.
  */
 describe("extension load", () => {
-	it("default export registers session_start, session_shutdown, /gpg-doctor, /gpg-status", async () => {
+	it("default export registers session lifecycle + Phase 1/2 commands", async () => {
 		const mod = await import("../src/index.js");
 		expect(typeof mod.default).toBe("function");
 
@@ -32,5 +32,8 @@ describe("extension load", () => {
 		expect(events).toContain("session_shutdown");
 		expect(commands).toContain("gpg-doctor");
 		expect(commands).toContain("gpg-status");
+		expect(commands).toContain("gpg-unlock");
+		expect(commands).toContain("gpg-lock");
+		expect(commands).toContain("gpg-config");
 	});
 });

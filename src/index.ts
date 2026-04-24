@@ -10,19 +10,22 @@
  *   - /gpg-unlock, /gpg-lock, /gpg-status commands with real behavior
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import { DEFAULT_CACHE_TTL_MS, MAX_CACHE_TTL_MS, PassphraseCache } from "./cache.js";
+import { createFileConfigStore, describeConfig, type PiGpgConfig } from "./config.js";
 import { analyzeCommand, type GitSigningConfigSnapshot } from "./detect.js";
-import { renderReport, runDoctor } from "./doctor.js";
+import { renderReport, runDoctor, type SecretKey } from "./doctor.js";
 import { buildBashEnvPrefix, injectEnvBeforeGit } from "./env.js";
 import type { ExecFn } from "./exec.js";
+import { formatGateReason, runSignGate } from "./gate.js";
 import { resolveSigningKey } from "./keys.js";
 import { PassfileRegistry } from "./passfile.js";
 import { promptPassphrase } from "./prompt.js";
 import { makeSessionState, type SessionState } from "./session-state.js";
 import { ensureExecutable, resolveShim } from "./shim.js";
 import { createGitCommitTool, isLikelyBadPassphrase } from "./tools/git-commit.js";
+import { isTouchIdSupportedPlatform } from "./touchid.js";
 
 type Severity = "ok" | "info" | "warning" | "error";
 
@@ -42,8 +45,27 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 		try {
 			const report = await runDoctor(exec, { cwd: ctx.cwd });
 
-			const ttlDefaultMs = (report.agentConf.defaultCacheTtl ?? DEFAULT_CACHE_TTL_MS / 1000) * 1000;
-			const ttlMaxMs = (report.agentConf.maxCacheTtl ?? MAX_CACHE_TTL_MS / 1000) * 1000;
+			// Load persistent pi-gpg config. Failure to load is non-fatal — we
+			// start with defaults and surface a notify so the user can recover.
+			const configStore = createFileConfigStore();
+			let config: PiGpgConfig;
+			try {
+				config = await configStore.load();
+			} catch (err) {
+				ctx.ui.notify(`pi-gpg: ${errMsg(err)} — continuing with defaults.`, "warning");
+				const { DEFAULT_CONFIG } = await import("./config.js");
+				config = { ...DEFAULT_CONFIG };
+			}
+
+			// TTL resolution order: user override → gpg-agent.conf → built-in default.
+			const ttlDefaultMs =
+				config.idleTtlSeconds != null
+					? config.idleTtlSeconds * 1000
+					: (report.agentConf.defaultCacheTtl ?? DEFAULT_CACHE_TTL_MS / 1000) * 1000;
+			const ttlMaxMs =
+				config.maxTtlSeconds != null
+					? config.maxTtlSeconds * 1000
+					: (report.agentConf.maxCacheTtl ?? MAX_CACHE_TTL_MS / 1000) * 1000;
 			const cache = new PassphraseCache({
 				defaultCacheTtlMs: ttlDefaultMs,
 				maxCacheTtlMs: ttlMaxMs,
@@ -61,16 +83,30 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 				cache,
 				passfiles,
 				canSign,
+				config,
+				configStore,
 				...(report.gpg.path ? { realGpgPath: report.gpg.path } : {}),
 			});
 
-			// Register the tool now that we have state.
+			// Register the tool now that we have state. The gateSupplier closes
+			// over `state` so it always sees the latest config / confirmed-keys
+			// set — users can flip the policy via `/gpg-config` mid-session and
+			// the next `git_commit` honors it without a restart.
 			pi.registerTool(
 				createGitCommitTool({
 					exec,
 					cache,
 					shimPath: shim.path,
 					...(report.gpg.path ? { realGpgPath: report.gpg.path } : {}),
+					gateSupplier: (_ctxArg, base) => {
+						const s = state;
+						if (!s) return null;
+						return {
+							config: s.config,
+							confirmedKeys: s.confirmedKeys,
+							...base,
+						};
+					},
 				}),
 			);
 
@@ -178,6 +214,24 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 			s.cache.put(key.keyid, passphrase);
 		}
 
+		// Run the sign-gate (Touch ID + confirm). Failure blocks the bash
+		// command before we ever write the passfile — no shim spawn, no disk
+		// exposure of anything beyond what was already in the cache.
+		const subcommandsForGate = Array.from(new Set(analysis.invocations.map((i) => i.subcommand))).join(", ");
+		const gateResult = await runSignGate(ctx, {
+			config: s.config,
+			confirmedKeys: s.confirmedKeys,
+			keyid: key.keyid,
+			keyDisplay: key.display,
+			operation: `git ${subcommandsForGate}`,
+			fromCache,
+			...(ctx.signal ? { signal: ctx.signal } : {}),
+		});
+		if (!gateResult.ok) {
+			passphrase.fill(0);
+			return { block: true, reason: formatGateReason(gateResult) };
+		}
+
 		// Write to temp file for the shim to pick up.
 		const handle = await s.passfiles.allocate(passphrase);
 
@@ -271,7 +325,28 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 				}
 			}
 			lines.push(`live temp passfiles: ${s.passfiles.liveCount}`);
+			lines.push("");
+			for (const line of describeConfig(s.config)) lines.push(line);
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// /gpg-config — interactive editor for confirm / Touch ID / TTL / key
+	// ------------------------------------------------------------------
+	pi.registerCommand("gpg-config", {
+		description: "Edit pi-gpg settings: signing key, confirm policy, cache TTLs, Touch ID gating.",
+		handler: async (_args, ctx) => {
+			const s = state;
+			if (!s) {
+				ctx.ui.notify("pi-gpg: no session state; is the extension loaded?", "error");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("pi-gpg: /gpg-config requires interactive mode.", "warning");
+				return;
+			}
+			await runGpgConfigMenu(ctx, s, exec);
 		},
 	});
 
@@ -419,4 +494,187 @@ function invalidateAllCacheEntries(s: SessionState): number {
 	const stats = s.cache.stats();
 	for (const entry of stats.entries) s.cache.invalidate(entry.keyid);
 	return stats.size;
+}
+
+// ---------------------------------------------------------------------------
+// /gpg-config interactive menu
+// ---------------------------------------------------------------------------
+
+/**
+ * Top-level menu loop. Each iteration paints the current settings, offers a
+ * fixed set of actions, then dispatches. Exits on "Done" or Esc.
+ *
+ * Changes take effect immediately where reasonable (confirm policy, Touch
+ * ID toggle). TTL changes require notifying the user they apply on next
+ * session because resizing a live cache's TTLs mid-flight has surprising
+ * interactions with already-running expiry timers.
+ */
+async function runGpgConfigMenu(ctx: ExtensionContext, s: SessionState, exec: ExecFn): Promise<void> {
+	const DONE = "✓ Done";
+
+	// Loop until the user selects Done / cancels.
+	// Safety net: cap iterations so a bug can't spin a user's terminal.
+	for (let i = 0; i < 50; i++) {
+		const currentKeyLine = await describeEffectiveKey(exec, ctx.cwd);
+		const options = [
+			`Signing key:      ${currentKeyLine}`,
+			`Confirm policy:   ${s.config.confirmPolicy}`,
+			`Touch ID gating:  ${s.config.touchIdGating ? "on" : "off"}${
+				isTouchIdSupportedPlatform() ? "" : " (unsupported platform)"
+			}`,
+			`Idle TTL:         ${s.config.idleTtlSeconds != null ? `${s.config.idleTtlSeconds}s` : "(inherit)"}`,
+			`Max TTL:          ${s.config.maxTtlSeconds != null ? `${s.config.maxTtlSeconds}s` : "(inherit)"}`,
+			DONE,
+		];
+
+		const choice = await ctx.ui.select("pi-gpg settings — choose what to edit", options);
+		if (!choice || choice === DONE) return;
+
+		if (choice.startsWith("Signing key:")) {
+			await editSigningKey(ctx, exec);
+		} else if (choice.startsWith("Confirm policy:")) {
+			await editConfirmPolicy(ctx, s);
+		} else if (choice.startsWith("Touch ID gating:")) {
+			await editTouchIdGating(ctx, s);
+		} else if (choice.startsWith("Idle TTL:")) {
+			await editTtl(ctx, s, "idle");
+		} else if (choice.startsWith("Max TTL:")) {
+			await editTtl(ctx, s, "max");
+		}
+	}
+}
+
+async function describeEffectiveKey(exec: ExecFn, cwd: string): Promise<string> {
+	try {
+		const resolved = await resolveSigningKey(exec, { cwd });
+		return resolved.explicit ? resolved.display : "(gpg default)";
+	} catch {
+		return "(unknown)";
+	}
+}
+
+/**
+ * Let the user pick a secret key and optionally write it back to
+ * `git config --global user.signingkey`. We don't rewrite repo-local
+ * config — too much risk of surprising a shared workspace.
+ */
+async function editSigningKey(ctx: ExtensionContext, exec: ExecFn): Promise<void> {
+	const report = await runDoctor(exec, { cwd: ctx.cwd });
+	if (report.keys.length === 0) {
+		ctx.ui.notify("pi-gpg: no secret keys found in GNUPGHOME.", "warning");
+		return;
+	}
+
+	const options = report.keys.map((k) => formatKeyOption(k));
+	options.push("← Cancel");
+	const choice = await ctx.ui.select("Pick a signing key", options);
+	if (!choice || choice.startsWith("←")) return;
+
+	const picked = report.keys.find((k) => formatKeyOption(k) === choice);
+	if (!picked) return;
+
+	const ok = await ctx.ui.confirm(
+		"Set as global signing key?",
+		`This will run: git config --global user.signingkey ${picked.keyid}\n\nAffects every repo on this machine that doesn't override user.signingkey locally.`,
+	);
+	if (!ok) return;
+
+	const r = await exec("git", ["config", "--global", "user.signingkey", picked.keyid]);
+	if (r.code !== 0) {
+		ctx.ui.notify(`pi-gpg: git config failed — ${r.stderr.trim() || r.stdout.trim()}`, "error");
+		return;
+	}
+	ctx.ui.notify(`pi-gpg: user.signingkey → ${picked.keyid}.`, "info");
+}
+
+function formatKeyOption(k: SecretKey): string {
+	const uid = k.uids[0] ?? "(no uid)";
+	const exp = k.expired ? " ⚠ expired" : k.expires ? ` (expires ${k.expires.slice(0, 10)})` : "";
+	return `${k.keyid}  — ${uid}${exp}`;
+}
+
+async function editConfirmPolicy(ctx: ExtensionContext, s: SessionState): Promise<void> {
+	const options = [
+		`always${s.config.confirmPolicy === "always" ? "  ✓" : ""}`,
+		`first-in-session${s.config.confirmPolicy === "first-in-session" ? "  ✓" : ""}`,
+		`never${s.config.confirmPolicy === "never" ? "  ✓" : ""}`,
+		"← Cancel",
+	];
+	const choice = await ctx.ui.select("Per-commit confirm policy", options);
+	if (!choice || choice.startsWith("←")) return;
+
+	const picked = choice.startsWith("always")
+		? "always"
+		: choice.startsWith("first-in-session")
+			? "first-in-session"
+			: "never";
+
+	s.config.confirmPolicy = picked;
+	// Switching policy mid-session clears the remembered confirmed set — the
+	// user is asking us to re-evaluate, so make it obvious.
+	s.confirmedKeys.clear();
+	await persistConfig(ctx, s);
+	ctx.ui.notify(`pi-gpg: confirm policy → ${picked}.`, "info");
+}
+
+async function editTouchIdGating(ctx: ExtensionContext, s: SessionState): Promise<void> {
+	if (!isTouchIdSupportedPlatform()) {
+		ctx.ui.notify(
+			`pi-gpg: Touch ID gating isn't supported on ${process.platform}. Leaving ${s.config.touchIdGating ? "on (no-op)" : "off"}.`,
+			"warning",
+		);
+		return;
+	}
+	const options = [
+		`on${s.config.touchIdGating ? "  ✓" : ""}`,
+		`off${s.config.touchIdGating ? "" : "  ✓"}`,
+		"← Cancel",
+	];
+	const choice = await ctx.ui.select("Touch ID gating", options);
+	if (!choice || choice.startsWith("←")) return;
+
+	const desired = choice.startsWith("on");
+	if (desired === s.config.touchIdGating) return;
+	s.config.touchIdGating = desired;
+	await persistConfig(ctx, s);
+	ctx.ui.notify(
+		desired
+			? "pi-gpg: Touch ID gating → on. You'll be prompted before releasing any cached passphrase."
+			: "pi-gpg: Touch ID gating → off.",
+		"info",
+	);
+}
+
+async function editTtl(ctx: ExtensionContext, s: SessionState, kind: "idle" | "max"): Promise<void> {
+	const field: "idleTtlSeconds" | "maxTtlSeconds" = kind === "idle" ? "idleTtlSeconds" : "maxTtlSeconds";
+	const current = s.config[field];
+	const label = kind === "idle" ? "Idle TTL (seconds, or blank to inherit)" : "Max TTL (seconds, or blank to inherit)";
+	const raw = await ctx.ui.input(label, current != null ? String(current) : "");
+	if (raw === undefined) return; // cancelled
+
+	const trimmed = raw.trim();
+	if (trimmed === "") {
+		delete s.config[field];
+	} else {
+		const parsed = Number.parseInt(trimmed, 10);
+		if (!Number.isFinite(parsed) || parsed <= 0) {
+			ctx.ui.notify("pi-gpg: TTL must be a positive integer.", "warning");
+			return;
+		}
+		s.config[field] = parsed;
+	}
+
+	await persistConfig(ctx, s);
+	ctx.ui.notify(
+		`pi-gpg: ${kind} TTL → ${s.config[field] != null ? `${s.config[field]}s` : "(inherit)"} (applies on next session).`,
+		"info",
+	);
+}
+
+async function persistConfig(ctx: ExtensionContext, s: SessionState): Promise<void> {
+	try {
+		await s.configStore.save(s.config);
+	} catch (err) {
+		ctx.ui.notify(`pi-gpg: failed to persist config — ${errMsg(err)}`, "error");
+	}
 }

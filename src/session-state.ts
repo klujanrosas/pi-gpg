@@ -6,6 +6,8 @@
  */
 
 import type { PassphraseCache } from "./cache.js";
+import type { ConfigStore, PiGpgConfig } from "./config.js";
+import type { ConfirmedKeySet } from "./confirm.js";
 import type { PassfileRegistry } from "./passfile.js";
 
 export interface SessionState {
@@ -31,6 +33,18 @@ export interface SessionState {
 	 * invoked in `session_shutdown` before disposing the cache.
 	 */
 	unsubscribeCacheStatus?: () => void;
+	/**
+	 * Live pi-gpg config (confirm policy, Touch ID toggle, TTL overrides).
+	 * Mutated in place when the user changes settings via `/gpg-config`.
+	 */
+	config: PiGpgConfig;
+	/** Backing store for `config` — persists edits to disk. */
+	configStore: ConfigStore;
+	/**
+	 * Keys for which the user has already OK'd signing this session under the
+	 * `first-in-session` confirm policy. Cleared on session_shutdown.
+	 */
+	confirmedKeys: ConfirmedKeySet;
 }
 
 export function makeSessionState(args: {
@@ -40,6 +54,8 @@ export function makeSessionState(args: {
 	passfiles: PassfileRegistry;
 	realGpgPath?: string;
 	canSign: boolean;
+	config: PiGpgConfig;
+	configStore: ConfigStore;
 }): SessionState {
 	const state: SessionState = {
 		shimPath: args.shimPath,
@@ -48,6 +64,9 @@ export function makeSessionState(args: {
 		passfiles: args.passfiles,
 		pendingCleanups: new Map(),
 		canSign: args.canSign,
+		config: args.config,
+		configStore: args.configStore,
+		confirmedKeys: new Set(),
 	};
 	if (args.realGpgPath) state.realGpgPath = args.realGpgPath;
 	return state;
