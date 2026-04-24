@@ -61,7 +61,7 @@ pi install /absolute/path/to/pi-gpg
 ### Install from git (once pushed)
 
 ```sh
-pi install git:github.com/kennethlujan/pi-gpg
+pi install git:github.com/klujanrosas/pi-gpg
 ```
 
 ### Install from npm (once published)
