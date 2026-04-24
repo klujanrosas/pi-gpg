@@ -25,6 +25,12 @@ export interface SessionState {
 	 * circuit bash interception when pi-gpg can't possibly help.
 	 */
 	canSign: boolean;
+	/**
+	 * Tears down the `cache.onChange` subscription that drives the toolbar
+	 * status. Set by `session_start` once the subscription is wired up and
+	 * invoked in `session_shutdown` before disposing the cache.
+	 */
+	unsubscribeCacheStatus?: () => void;
 }
 
 export function makeSessionState(args: {

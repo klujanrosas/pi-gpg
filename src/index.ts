@@ -74,7 +74,17 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 				}),
 			);
 
-			// Passive status indicator. Refreshed on unlock/lock.
+			// Subscribe to cache mutations so the toolbar auto-refreshes on
+			// unlock, lock, successful git_commit, bad-passphrase invalidation,
+			// and background TTL expiry — without every mutator knowing about
+			// the status API. Retained in session state so `session_shutdown`
+			// can tear it down cleanly.
+			state.unsubscribeCacheStatus = cache.onChange(() => {
+				if (state) updateStatus(ctx, state);
+			});
+
+			// Passive status indicator — initial paint. Subsequent updates flow
+			// through the cache.onChange subscription above.
 			updateStatus(ctx, state);
 
 			if (!shim.exists) {
@@ -105,7 +115,9 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 		const s = state;
 		state = null;
 		if (!s) return;
+		s.unsubscribeCacheStatus?.();
 		s.cache.clear();
+		s.cache.dispose();
 		await s.passfiles.sweep();
 		// Drain any pending cleanups that never received tool_result (defensive).
 		const fns = Array.from(s.pendingCleanups.values());
@@ -189,7 +201,7 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 			`pi-gpg: routing \`git ${subcommands}\` through loopback shim (key ${key.display}${fromCache ? ", cached" : ""}).`,
 			"info",
 		);
-		updateStatus(ctx, s);
+		// Status update is emitted by cache.onChange subscriber — no manual call needed.
 
 		return undefined;
 	});
@@ -214,7 +226,7 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 						}. The next \`git commit -S\` will re-prompt.`,
 						"warning",
 					);
-					updateStatus(ctx, s);
+					// Toolbar refresh happens via cache.onChange subscriber.
 				}
 			}
 		} finally {
@@ -284,7 +296,7 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 			s.cache.put(key.keyid, result.passphrase);
 			result.passphrase.fill(0);
 			ctx.ui.notify(`pi-gpg: 🔓 unlocked key ${key.display}.`, "info");
-			updateStatus(ctx, s);
+			// Toolbar refresh happens via cache.onChange subscriber.
 		},
 	});
 
@@ -296,7 +308,7 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 			const count = s.cache.stats().size;
 			s.cache.clear();
 			ctx.ui.notify(`pi-gpg: 🔒 locked (${count} entr${count === 1 ? "y" : "ies"} zeroized).`, "info");
-			updateStatus(ctx, s);
+			// Toolbar refresh happens via cache.onChange subscriber.
 		},
 	});
 }

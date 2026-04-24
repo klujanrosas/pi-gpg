@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_CACHE_TTL_MS, MAX_CACHE_TTL_MS, PassphraseCache } from "../src/cache.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { type CacheChangeEvent, DEFAULT_CACHE_TTL_MS, MAX_CACHE_TTL_MS, PassphraseCache } from "../src/cache.js";
 
 describe("PassphraseCache", () => {
 	let now: number;
@@ -98,6 +98,156 @@ describe("PassphraseCache", () => {
 		cache.put("K", Buffer.from("pw"));
 		expect(cache.has("K")).toBe(true);
 		expect(cache.has("K")).toBe(true);
+	});
+
+	describe("change events", () => {
+		it("fires `put` on new entry, `invalidate` on explicit drop", () => {
+			const events: CacheChangeEvent[] = [];
+			cache.onChange((e) => events.push(e));
+
+			cache.put("A", Buffer.from("x"));
+			expect(events).toEqual([{ reason: "put", keyid: "A", size: 1 }]);
+
+			cache.invalidate("A");
+			expect(events).toEqual([
+				{ reason: "put", keyid: "A", size: 1 },
+				{ reason: "invalidate", keyid: "A", size: 0 },
+			]);
+		});
+
+		it("fires `clear` once for any non-empty cache", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+
+			cache.put("A", Buffer.from("x"));
+			cache.put("B", Buffer.from("y"));
+			listener.mockClear();
+
+			cache.clear();
+			expect(listener).toHaveBeenCalledTimes(1);
+			expect(listener).toHaveBeenCalledWith({ reason: "clear", size: 0 });
+		});
+
+		it("does not fire `clear` on an already-empty cache", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+			cache.clear();
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("does not fire `invalidate` on a miss", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+			expect(cache.invalidate("nope")).toBe(false);
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("put-replace emits a single `put` (not invalidate+put)", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+			cache.put("A", Buffer.from("one"));
+			listener.mockClear();
+
+			cache.put("A", Buffer.from("two"));
+			expect(listener).toHaveBeenCalledTimes(1);
+			expect(listener).toHaveBeenCalledWith({ reason: "put", keyid: "A", size: 1 });
+		});
+
+		it("unsubscribe stops delivery", () => {
+			const listener = vi.fn();
+			const unsubscribe = cache.onChange(listener);
+			cache.put("A", Buffer.from("x"));
+			expect(listener).toHaveBeenCalledTimes(1);
+
+			unsubscribe();
+			cache.invalidate("A");
+			expect(listener).toHaveBeenCalledTimes(1);
+		});
+
+		it("listener exceptions don't break mutations or other listeners", () => {
+			const good = vi.fn();
+			cache.onChange(() => {
+				throw new Error("boom");
+			});
+			cache.onChange(good);
+
+			expect(() => cache.put("A", Buffer.from("x"))).not.toThrow();
+			expect(good).toHaveBeenCalledTimes(1);
+			expect(cache.get("A")?.toString("utf8")).toBe("x");
+		});
+
+		it("lazy eviction during `get` emits `expire`", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+			cache.put("K", Buffer.from("pw"));
+			listener.mockClear();
+
+			now += 600_001; // past idle TTL
+			expect(cache.get("K")).toBeNull();
+			expect(listener).toHaveBeenCalledTimes(1);
+			expect(listener).toHaveBeenCalledWith({ reason: "expire", keyid: "K", size: 0 });
+		});
+
+		it("manual sweepExpired emits `expire` per evicted entry", () => {
+			const listener = vi.fn();
+			cache.onChange(listener);
+			cache.put("A", Buffer.from("1"));
+			cache.put("B", Buffer.from("2"));
+			listener.mockClear();
+
+			now += 600_001;
+			const evicted = cache.sweepExpired();
+			expect(evicted).toBe(2);
+			expect(listener).toHaveBeenCalledTimes(2);
+			expect(listener.mock.calls[0]?.[0].reason).toBe("expire");
+			expect(listener.mock.calls[1]?.[0].reason).toBe("expire");
+		});
+	});
+
+	describe("auto-expiry timer", () => {
+		it("is disabled when `now` is mocked (opt-out default)", () => {
+			const c = new PassphraseCache({ now: () => 0 });
+			c.put("K", Buffer.from("pw"));
+			// No timer means this test returns immediately — we're only asserting
+			// that constructing+mutating doesn't schedule a real setTimeout that
+			// would leak across tests.
+			c.dispose();
+		});
+
+		it("evicts and emits `expire` automatically when idle TTL elapses", async () => {
+			const c = new PassphraseCache({
+				defaultCacheTtlMs: 20,
+				maxCacheTtlMs: 10_000,
+			});
+			try {
+				const events: CacheChangeEvent[] = [];
+				c.onChange((e) => events.push(e));
+				c.put("K", Buffer.from("pw"));
+
+				await new Promise((r) => setTimeout(r, 80));
+				const expire = events.find((e) => e.reason === "expire");
+				expect(expire?.keyid).toBe("K");
+				expect(c.stats().size).toBe(0);
+			} finally {
+				c.dispose();
+			}
+		});
+
+		it("dispose() cancels the timer", async () => {
+			const c = new PassphraseCache({
+				defaultCacheTtlMs: 20,
+				maxCacheTtlMs: 10_000,
+			});
+			const listener = vi.fn();
+			c.onChange(listener);
+			c.put("K", Buffer.from("pw"));
+			c.dispose();
+
+			await new Promise((r) => setTimeout(r, 80));
+			// After dispose, no further events should arrive (listeners are also
+			// dropped, so even if a stray timer fired we'd not see it).
+			expect(listener).toHaveBeenCalledTimes(1); // just the original `put`
+		});
 	});
 
 	it("formatRemaining produces sane labels", () => {
