@@ -22,7 +22,7 @@ import { PassfileRegistry } from "./passfile.js";
 import { promptPassphrase } from "./prompt.js";
 import { makeSessionState, type SessionState } from "./session-state.js";
 import { ensureExecutable, resolveShim } from "./shim.js";
-import { createGitCommitTool } from "./tools/git-commit.js";
+import { createGitCommitTool, isLikelyBadPassphrase } from "./tools/git-commit.js";
 
 type Severity = "ok" | "info" | "warning" | "error";
 
@@ -194,14 +194,32 @@ export default function piGpgExtension(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	// Drain the bash route's temp file as soon as the tool completes.
-	pi.on("tool_result", async (event, _ctx) => {
+	// Drain the bash route's temp file as soon as the tool completes. We also
+	// inspect the result for signing failures: if gpg rejected the passphrase we
+	// clear the cache so the *next* bash `git commit -S` invocation re-prompts
+	// fresh, mirroring pinentry's "try again" behavior across retries.
+	pi.on("tool_result", async (event, ctx) => {
 		const s = state;
 		if (!s) return;
 		const cleanup = s.pendingCleanups.get(event.toolCallId);
 		if (!cleanup) return;
 		s.pendingCleanups.delete(event.toolCallId);
-		await cleanup();
+		try {
+			if (looksLikeBashSignFailure(event)) {
+				const invalidated = invalidateAllCacheEntries(s);
+				if (invalidated > 0) {
+					ctx.ui.notify(
+						`pi-gpg: signing failed in bash — cleared ${invalidated} cached passphrase${
+							invalidated === 1 ? "" : "s"
+						}. The next \`git commit -S\` will re-prompt.`,
+						"warning",
+					);
+					updateStatus(ctx, s);
+				}
+			}
+		} finally {
+			await cleanup();
+		}
 	});
 
 	// ------------------------------------------------------------------
@@ -331,4 +349,62 @@ async function readSigningConfigSnapshot(exec: ExecFn, cwd: string): Promise<Git
 
 function errMsg(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Best-effort inspection of a bash tool_result. Pi's result shapes differ across
+ * versions, so we poke at a few common fields and collapse anything that smells
+ * like a signing failure into one combined string for the detector.
+ */
+function looksLikeBashSignFailure(event: unknown): boolean {
+	if (!event || typeof event !== "object") return false;
+	const e = event as Record<string, unknown>;
+
+	// Some runners surface tool errors on a boolean flag; always inspect the
+	// output regardless since success + signing-failure-in-output is possible
+	// when the bash command is `git ... && foo` or similar.
+	const pieces: string[] = [];
+	const push = (v: unknown) => {
+		if (typeof v === "string") pieces.push(v);
+	};
+
+	push(e.stdout);
+	push(e.stderr);
+	push(e.output);
+	push(e.error);
+
+	const result = e.result as Record<string, unknown> | undefined;
+	if (result) {
+		push(result.stdout);
+		push(result.stderr);
+		push(result.output);
+		const content = result.content;
+		if (Array.isArray(content)) {
+			for (const item of content) {
+				if (item && typeof item === "object" && "text" in item) push((item as Record<string, unknown>).text);
+			}
+		}
+	}
+
+	const content = e.content;
+	if (Array.isArray(content)) {
+		for (const item of content) {
+			if (item && typeof item === "object" && "text" in item) push((item as Record<string, unknown>).text);
+		}
+	}
+
+	if (pieces.length === 0) return false;
+	return isLikelyBadPassphrase(pieces.join("\n"));
+}
+
+/**
+ * Zero every entry in the cache. Used when a bash signing attempt fails and we
+ * don't know which specific keyid it was targeting (the event doesn't always
+ * carry the signing key). Scope is per-session so this is at most a handful
+ * of entries.
+ */
+function invalidateAllCacheEntries(s: SessionState): number {
+	const stats = s.cache.stats();
+	for (const entry of stats.entries) s.cache.invalidate(entry.keyid);
+	return stats.size;
 }

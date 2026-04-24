@@ -42,6 +42,30 @@ export interface GitCommitToolDeps {
 	realGpgPath?: string;
 }
 
+/**
+ * Number of passphrase prompts shown before giving up, mirroring pinentry's
+ * default retry count. Cache hits don't consume an attempt — only user-visible
+ * prompts do, matching what a human experiences at a pinentry dialog.
+ */
+const MAX_PASSPHRASE_PROMPTS = 3;
+
+/**
+ * Heuristic check: does the combined git/gpg output indicate a bad passphrase?
+ *
+ * `git commit -S` with `--batch --pinentry-mode loopback` and a wrong passphrase
+ * can surface as any of these, depending on whether git relays gpg's stderr:
+ *   - `gpg: signing failed: Bad passphrase`  (explicit)
+ *   - `Bad passphrase`                       (explicit)
+ *   - `error: gpg failed to sign the data` + `fatal: failed to write commit object`
+ *     (git's generic wrapper — by far the most common reason in our loopback
+ *     setup, so we treat it as probable-bad-passphrase and retry)
+ */
+export function isLikelyBadPassphrase(output: string): boolean {
+	return /bad passphrase|passphrase is incorrect|signing failed|gpg failed to sign|failed to write commit object/i.test(
+		output,
+	);
+}
+
 export function createGitCommitTool(deps: GitCommitToolDeps): ToolDefinition<typeof GitCommitInputSchema> {
 	return {
 		name: "git_commit",
@@ -67,32 +91,6 @@ export function createGitCommitTool(deps: GitCommitToolDeps): ToolDefinition<typ
 				explicitKeyid: params.keyid,
 			});
 
-			// Resolve passphrase — cache hit, else prompt, else fail cleanly.
-			let passphrase = deps.cache.get(key.keyid);
-			let fromCache = true;
-			if (!passphrase) {
-				fromCache = false;
-				const result = await promptPassphrase(ctx, {
-					title: "🔑 pi-gpg passphrase",
-					placeholder: "passphrase",
-					keyid: key.display,
-					...(signal ? { signal } : {}),
-				});
-				if (!result.ok) {
-					const reasonText =
-						result.reason === "no-ui"
-							? "Passphrase not cached and no UI available. Run /gpg-unlock in interactive mode first, or enable key caching in your environment."
-							: "Passphrase entry cancelled by user.";
-					throw new Error(`git_commit: ${reasonText}`);
-				}
-				passphrase = result.passphrase;
-			}
-
-			onUpdate?.({
-				content: [{ type: "text", text: `Signing with key ${key.display}${fromCache ? " (cached)" : ""}…` }],
-				details: {},
-			});
-
 			const args: string[] = ["commit", "-S", "-m", message];
 			if (params.keyid) {
 				// Re-pass the keyid to git so it matches what we resolved (handles
@@ -111,57 +109,115 @@ export function createGitCommitTool(deps: GitCommitToolDeps): ToolDefinition<typ
 				args.push("--", ...params.paths);
 			}
 
-			const gitOpts: Parameters<typeof runGitWithFd3Passphrase>[0] = {
-				args,
-				shimPath: deps.shimPath,
-				cwd: ctx.cwd,
-				passphrase,
-				onStdout: (s) => onUpdate?.({ content: [{ type: "text", text: s }], details: {} }),
-				onStderr: (s) => onUpdate?.({ content: [{ type: "text", text: s }], details: {} }),
-			};
-			if (signal) gitOpts.signal = signal;
-			if (deps.realGpgPath) gitOpts.realGpgPath = deps.realGpgPath;
+			// Retry loop — mirrors pinentry's default of up to 3 prompts on bad
+			// passphrase. Cache hits don't consume an attempt; only user-visible
+			// prompts do. Non-passphrase errors bail out immediately.
+			let promptCount = 0;
+			let lastFailure: { code: number; combined: string } | null = null;
 
-			const { code, stdout, stderr } = await runGitWithFd3Passphrase(gitOpts);
+			while (true) {
+				// Acquire the passphrase: cache first, then prompt if needed.
+				let passphrase = deps.cache.get(key.keyid);
+				const fromCache = passphrase !== null;
 
-			// Cache write-through (only after a successful sign) so subsequent
-			// commits in this session don't re-prompt.
-			if (code === 0 && !fromCache) {
-				deps.cache.put(key.keyid, passphrase);
-			} else if (code !== 0 && !fromCache) {
-				// Bad passphrase or other sign error — don't poison the cache.
-			}
-
-			// Zeroize our in-hand copy after spawn has written it to the pipe.
-			zeroize(passphrase);
-
-			if (code !== 0) {
-				const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-				const looksLikeBadPassphrase = /bad passphrase|passphrase is incorrect/i.test(combined);
-				if (looksLikeBadPassphrase) {
-					deps.cache.invalidate(key.keyid);
+				if (!passphrase) {
+					if (promptCount >= MAX_PASSPHRASE_PROMPTS) {
+						// Exhausted retries — surface the last real failure.
+						const last = lastFailure ?? { code: 1, combined: "" };
+						throw new Error(
+							`git_commit: bad passphrase for key ${key.display} after ${MAX_PASSPHRASE_PROMPTS} attempts.${
+								last.combined ? `\n${last.combined}` : ""
+							}`,
+						);
+					}
+					promptCount++;
+					const title =
+						promptCount === 1
+							? "🔑 pi-gpg passphrase"
+							: `🔑 Bad passphrase — retry ${promptCount}/${MAX_PASSPHRASE_PROMPTS}`;
+					const result = await promptPassphrase(ctx, {
+						title,
+						placeholder: "passphrase",
+						keyid: key.display,
+						...(signal ? { signal } : {}),
+					});
+					if (!result.ok) {
+						const reasonText =
+							result.reason === "no-ui"
+								? "Passphrase not cached and no UI available. Run /gpg-unlock in interactive mode first, or enable key caching in your environment."
+								: "Passphrase entry cancelled by user.";
+						throw new Error(`git_commit: ${reasonText}`);
+					}
+					passphrase = result.passphrase;
 				}
-				throw new Error(
-					looksLikeBadPassphrase
-						? `git_commit: bad passphrase for key ${key.display}. Cache cleared; try again.`
-						: `git_commit: git exited ${code}.\n${combined}`,
-				);
+
+				onUpdate?.({
+					content: [
+						{
+							type: "text",
+							text: `Signing with key ${key.display}${fromCache ? " (cached)" : ""}${
+								promptCount > 1 ? ` (attempt ${promptCount}/${MAX_PASSPHRASE_PROMPTS})` : ""
+							}…`,
+						},
+					],
+					details: {},
+				});
+
+				const gitOpts: Parameters<typeof runGitWithFd3Passphrase>[0] = {
+					args,
+					shimPath: deps.shimPath,
+					cwd: ctx.cwd,
+					passphrase,
+					onStdout: (s) => onUpdate?.({ content: [{ type: "text", text: s }], details: {} }),
+					onStderr: (s) => onUpdate?.({ content: [{ type: "text", text: s }], details: {} }),
+				};
+				if (signal) gitOpts.signal = signal;
+				if (deps.realGpgPath) gitOpts.realGpgPath = deps.realGpgPath;
+
+				const { code, stdout, stderr } = await runGitWithFd3Passphrase(gitOpts);
+
+				if (code === 0) {
+					// Cache the good passphrase (defensive copy inside `put`) before zeroing.
+					if (!fromCache) deps.cache.put(key.keyid, passphrase);
+					zeroize(passphrase);
+
+					const summary = summarizeCommit(stdout, stderr);
+					return {
+						content: [{ type: "text", text: summary || stdout || stderr || "(no output)" }],
+						details: {
+							subcommand: "commit",
+							keyid: key.keyid,
+							keyidDisplay: key.display,
+							fromCache,
+							attempts: promptCount,
+							summary,
+							stdout,
+							stderr,
+						},
+					};
+				}
+
+				// Signing failed. Always zero our in-hand copy first.
+				zeroize(passphrase);
+
+				const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+				lastFailure = { code, combined };
+
+				if (isLikelyBadPassphrase(combined)) {
+					// Drop the stale entry so the next iteration prompts fresh.
+					deps.cache.invalidate(key.keyid);
+					ctx.ui.notify(
+						fromCache
+							? `pi-gpg: cached passphrase for ${key.display} rejected — re-prompting.`
+							: `pi-gpg: bad passphrase (attempt ${promptCount}/${MAX_PASSPHRASE_PROMPTS}) — try again.`,
+						"warning",
+					);
+					continue; // loop: will re-prompt on next iteration (cache is empty)
+				}
+
+				// Non-passphrase failure — do not retry.
+				throw new Error(`git_commit: git exited ${code}.\n${combined}`);
 			}
-
-			const summary = summarizeCommit(stdout, stderr);
-
-			return {
-				content: [{ type: "text", text: summary || stdout || stderr || "(no output)" }],
-				details: {
-					subcommand: "commit",
-					keyid: key.keyid,
-					keyidDisplay: key.display,
-					fromCache,
-					summary,
-					stdout,
-					stderr,
-				},
-			};
 		},
 	};
 }
